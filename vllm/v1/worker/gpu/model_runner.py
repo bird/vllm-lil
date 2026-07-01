@@ -222,9 +222,9 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             if self.is_last_pp_rank:
                 self.speculator = init_speculator(self.vllm_config, self.device)
 
-            if self.speculative_config.method in ("eagle3", "dflash"):
-                # EAGLE3/DFlash require auxiliary hidden states from target
-                # model outputs.
+            if self.speculative_config.method in ("eagle3", "dflash", "dspark"):
+                # EAGLE3/DFlash/DSpark require auxiliary hidden states from
+                # target model outputs.
                 self.use_aux_hidden_state_outputs = True
                 if self.use_pp:
                     raise ValueError(
