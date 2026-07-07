@@ -306,6 +306,19 @@ class DeepSeekMultiTokenPredictorLayer(nn.Module):
         quant_config = _maybe_disable_unserialized_modelopt_fp4_nextn(
             config, vllm_config, get_draft_quant_config(vllm_config)
         )
+        if quant_config is not None:
+            # Draft quant configs are built fresh (get_draft_quant_config) and
+            # never pass through configure_quant_config, so fused-module shard
+            # expansion is empty; quant schemes whose targets name the
+            # constituent projections (q_a_proj / kv_a_proj_with_mqa) then
+            # fail to match the fused module and the block silently builds
+            # unquantized, breaking checkpoints with quantized NextN layers.
+            quant_config.packed_modules_mapping.setdefault(
+                "fused_qkv_a_proj", ["q_a_proj", "kv_a_proj_with_mqa"]
+            )
+            quant_config.packed_modules_mapping.setdefault(
+                "gate_up_proj", ["gate_proj", "up_proj"]
+            )
 
         self.enorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.hnorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
@@ -323,10 +336,7 @@ class DeepSeekMultiTokenPredictorLayer(nn.Module):
                 device=self.device,
             )
             topk_scores_buffer = None
-            if (
-                vllm_config.parallel_config.decode_context_parallel_size > 1
-                and use_b12x_sparse_indexer()
-            ):
+            if vllm_config.parallel_config.decode_context_parallel_size > 1:
                 topk_scores_buffer = torch.empty(
                     vllm_config.scheduler_config.max_num_batched_tokens,
                     topk_tokens,
