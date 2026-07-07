@@ -408,6 +408,19 @@ def request_memory(init_snapshot: MemorySnapshot, cache_config: CacheConfig) -> 
     )
 
     if init_snapshot.free_memory < requested_memory:
+        import os as _os
+        if _os.environ.get("VLLM_RELAX_MEMORY_CHECK", "0") == "1":
+            from vllm.logger import init_logger as _il
+            _margin = 2 << 30
+            _clamped = max(0, init_snapshot.free_memory - _margin)
+            _il(__name__).warning(
+                "VLLM_RELAX_MEMORY_CHECK=1: free %.2f GiB < requested %.2f GiB; "
+                "clamping budget to free-2GiB = %.2f GiB",
+                init_snapshot.free_memory / (1 << 30),
+                requested_memory / (1 << 30),
+                _clamped / (1 << 30),
+            )
+            return _clamped
         raise ValueError(
             f"Free memory on device {init_snapshot.device_} "
             f"({format_gib(init_snapshot.free_memory)}/"
