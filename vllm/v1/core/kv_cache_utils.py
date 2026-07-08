@@ -1509,6 +1509,13 @@ def group_and_unify_kv_cache_specs(
     ] = defaultdict(dict)
     # dcp_replicated non-MLA groups (e.g. the DFlash draft), keyed by block_size.
     grouped_repl_specs: dict[tuple[int], dict[str, KVCacheSpec]] = defaultdict(dict)
+    # Non-MLA full-attention drafts without DCP replication (DFlash/DSpark at
+    # DCP=1). Ideally these ride the full-MLA group's block table: every block
+    # id then covers the same token range in target and draft layers, and the
+    # draft pages become extra per-block arena buckets. A separate group would
+    # roughly double the block-id count for full-length sequences, with every
+    # extra id paying for every other group's slots.
+    draft_full_specs: dict[str, KVCacheSpec] = {}
     # NOTE: Here we group SWA layers by (block_size, sliding_window,
     # dcp_sharded), which separates SWA layers, C4I+C4A layers, and C128A
     # layers into different groups.
@@ -1520,6 +1527,24 @@ def group_and_unify_kv_cache_specs(
         elif isinstance(spec, MLAAttentionSpec):
             mla_specs[name] = spec
         elif getattr(spec, "dcp_replicated", False):
+            grouped_repl_specs[(spec.block_size,)][name] = spec
+        elif isinstance(spec, FullAttentionSpec):
+            draft_full_specs[name] = spec
+
+    if draft_full_specs and mla_specs:
+        mla_block = next(iter(mla_specs.values())).block_size
+        merged = dict(mla_specs)
+        merged.update(draft_full_specs)
+        if (
+            all(s.block_size == mla_block for s in draft_full_specs.values())
+            and UniformTypeKVCacheSpecs.from_specs(merged) is not None
+        ):
+            mla_specs = merged
+        else:
+            for name, spec in draft_full_specs.items():
+                grouped_repl_specs[(spec.block_size,)][name] = spec
+    elif draft_full_specs:
+        for name, spec in draft_full_specs.items():
             grouped_repl_specs[(spec.block_size,)][name] = spec
 
     if len(mla_specs) == 0:
@@ -1582,11 +1607,13 @@ def _get_kv_cache_groups_uniform_groups(
     assert len(grouped_specs) > 0 and all(
         isinstance(spec, UniformTypeKVCacheSpecs) for spec in grouped_specs
     )
-    # For now, we restrict the first grouped_spec to be UniformTypeKVCacheSpecs
-    # containing only MLAAttentionSpec.
+    # The first grouped_spec anchors the layout: MLAAttentionSpec layers,
+    # optionally joined by same-block-size full-attention draft layers
+    # (DFlash/DSpark at DCP=1) that ride the same block table and appear as
+    # extra page-size buckets in the arena.
     full_mla_spec = grouped_specs[0]
     assert all(
-        isinstance(spec, MLAAttentionSpec)
+        isinstance(spec, (MLAAttentionSpec, FullAttentionSpec))
         for spec in full_mla_spec.kv_cache_specs.values()
     )
     full_mla_group = KVCacheGroupSpec(

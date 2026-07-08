@@ -279,7 +279,13 @@ class Attention(nn.Module, AttentionLayerBase):
             if str(layer_idx) in cache_config.kv_cache_dtype_skip_layers:
                 skip = True
             if skip:
-                kv_cache_dtype = "auto"
+                import os as _os
+
+                # Default "auto" (bf16). VLLM_KV_SKIP_LAYERS_DTYPE=fp8 halves
+                # skipped-layer KV (e.g. the wide DSpark draft) at scale 1.0.
+                kv_cache_dtype = _os.environ.get(
+                    "VLLM_KV_SKIP_LAYERS_DTYPE", "auto"
+                )
                 calculate_kv_scales = False
             logger.debug(
                 "Layer %s: kv_cache_dtype=%s, sliding_window=%s",
