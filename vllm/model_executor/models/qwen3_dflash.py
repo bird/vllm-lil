@@ -108,6 +108,15 @@ class DFlashAttention(Attention):
         dcp_replicated = (
             vllm_config.parallel_config.decode_context_parallel_size > 1
         )
+        # Wide-KV drafts (e.g. the GLM DSpark speculator: 64 kv heads, 4KB
+        # bf16 per token per rank) overflow the MLA target page at the global
+        # block size; a smaller draft block keeps the draft page under the
+        # full-MLA page so the DeepseekV4 uniform-group padding can absorb it.
+        # Must stay a multiple of 16 (FLASH_ATTN kernel block granularity).
+        import os as _os
+        _draft_bs = int(
+            _os.environ.get("VLLM_DFLASH_DRAFT_BLOCK_SIZE", 0)
+        ) or vllm_config.cache_config.block_size
         if self.sliding_window is not None:
             # Build the full spec directly instead of converting the parent's
             # SlidingWindowSpec: Attention.get_kv_cache_spec asserts against
@@ -116,7 +125,7 @@ class DFlashAttention(Attention):
             # though the draft layer itself is not MLA.
             assert self.attn_type == AttentionType.DECODER
             return FullAttentionSpec(
-                block_size=vllm_config.cache_config.block_size,
+                block_size=_draft_bs,
                 num_kv_heads=self.num_kv_heads,
                 head_size=self.head_size,
                 head_size_v=self.head_size_v,
@@ -125,8 +134,11 @@ class DFlashAttention(Attention):
                 dcp_replicated=dcp_replicated,
             )
         spec = super().get_kv_cache_spec(vllm_config)
-        if dcp_replicated and isinstance(spec, FullAttentionSpec):
-            spec = dataclasses.replace(spec, dcp_replicated=True)
+        if isinstance(spec, FullAttentionSpec):
+            if _draft_bs != vllm_config.cache_config.block_size:
+                spec = dataclasses.replace(spec, block_size=_draft_bs)
+            if dcp_replicated:
+                spec = dataclasses.replace(spec, dcp_replicated=True)
         return spec
 
 
