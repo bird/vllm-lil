@@ -333,9 +333,21 @@ class DFlashQwen3Attention(nn.Module):
     ) -> None:
         self._ensure_ring(k.device, k.dtype)
         w = self._ring_window
-        slots = positions.to(torch.long).remainder(w)
-        kk = k.view(-1, self.num_kv_heads, self.head_dim)
-        vv = v.view(-1, self.num_kv_heads, self.head_dim)
+        pos = positions.to(torch.long)
+        # A prefill chunk can exceed W, wrapping slots several times within one
+        # scatter; duplicate indices make the write order undefined. Keep only
+        # each row's trailing W positions - any W consecutive positions map to
+        # unique slots, so the scatter is deterministic and the ring ends up
+        # holding exactly the last W context tokens per row.
+        row_max = torch.zeros(
+            self.ring_k.shape[0], dtype=pos.dtype, device=pos.device
+        )
+        row_max.scatter_reduce_(0, rows, pos, reduce="amax", include_self=False)
+        keep = pos > (row_max[rows] - w)
+        rows = rows[keep]
+        slots = pos[keep].remainder(w)
+        kk = k.view(-1, self.num_kv_heads, self.head_dim)[keep]
+        vv = v.view(-1, self.num_kv_heads, self.head_dim)[keep]
         self.ring_k[rows, slots] = kk
         self.ring_v[rows, slots] = vv
 
