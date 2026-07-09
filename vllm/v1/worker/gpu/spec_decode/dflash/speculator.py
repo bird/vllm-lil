@@ -123,6 +123,10 @@ class DFlashSpeculator(DraftModelSpeculator):
                 self.max_num_tokens, dtype=torch.long, device=device
             )
             self._ring_arange_w = torch.arange(w, device=device)
+            self._ring_zero = torch.zeros((), dtype=self.dtype, device=device)
+            self._ring_neg_inf = torch.full(
+                (), float("-inf"), dtype=self.dtype, device=device
+            )
             # scratch sinks for prepare_dflash_inputs paged bookkeeping
             self._ring_scratch_slots = torch.zeros(
                 self.max_num_tokens, dtype=torch.int64, device=device
@@ -468,7 +472,9 @@ class DFlashSpeculator(DraftModelSpeculator):
             qsl = input_batch.query_start_loc[: num_r + 1].to(torch.long)
             lens = qsl[1:] - qsl[:-1]
             DSPARK_RING_CTX.ctx_rows[:num_target_tokens] = (
-                torch.repeat_interleave(idx_map, lens)
+                torch.repeat_interleave(
+                    idx_map, lens, output_size=num_target_tokens
+                )
             )
             DSPARK_RING_CTX.num_ctx_tokens = num_target_tokens
             valid = torch.clamp(
@@ -476,10 +482,8 @@ class DFlashSpeculator(DraftModelSpeculator):
             )
             win_mask = torch.where(
                 self._ring_arange_w[None, :] < valid[:, None],
-                torch.zeros((), dtype=self.dtype, device=valid.device),
-                torch.full(
-                    (), float("-inf"), dtype=self.dtype, device=valid.device
-                ),
+                self._ring_zero,
+                self._ring_neg_inf,
             )
             DSPARK_RING_CTX.attn_mask[idx_map, 0, 0, :w] = win_mask
         else:
