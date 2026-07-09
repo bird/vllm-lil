@@ -123,6 +123,7 @@ class DFlashSpeculator(DraftModelSpeculator):
                 self.max_num_tokens, dtype=torch.long, device=device
             )
             self._ring_arange_w = torch.arange(w, device=device)
+            self._ring_mask_steady = False
             self._ring_zero = torch.zeros((), dtype=self.dtype, device=device)
             self._ring_neg_inf = torch.full(
                 (), float("-inf"), dtype=self.dtype, device=device
@@ -477,15 +478,28 @@ class DFlashSpeculator(DraftModelSpeculator):
                 )
             )
             DSPARK_RING_CTX.num_ctx_tokens = num_target_tokens
-            valid = torch.clamp(
-                input_batch.seq_lens[:num_r].to(torch.long), max=w
+            # Steady-state long-context: once every active request is deeper
+            # than W (+gamma slack on the host-side upper bound), the window
+            # mask is all-zeros permanently - skip the rebuild entirely.
+            min_bound = int(
+                input_batch.seq_lens_cpu_upper_bound[:num_r].min()
             )
-            win_mask = torch.where(
-                self._ring_arange_w[None, :] < valid[:, None],
-                self._ring_zero,
-                self._ring_neg_inf,
-            )
-            DSPARK_RING_CTX.attn_mask[idx_map, 0, 0, :w] = win_mask
+            if not (
+                self._ring_mask_steady
+                and min_bound > w + self.num_query_per_req
+            ):
+                valid = torch.clamp(
+                    input_batch.seq_lens[:num_r].to(torch.long), max=w
+                )
+                win_mask = torch.where(
+                    self._ring_arange_w[None, :] < valid[:, None],
+                    self._ring_zero,
+                    self._ring_neg_inf,
+                )
+                DSPARK_RING_CTX.attn_mask[idx_map, 0, 0, :w] = win_mask
+                self._ring_mask_steady = (
+                    min_bound > w + self.num_query_per_req
+                )
         else:
             assert self.draft_kv_cache_group_id >= 0
             # Support multiple draft KV cache groups by preparing inputs once
