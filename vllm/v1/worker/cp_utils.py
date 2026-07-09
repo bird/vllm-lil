@@ -31,7 +31,9 @@ def check_attention_cp_compatibility(vllm_config: VllmConfig) -> None:
                     spec = get_spec(vllm_config)
                 except Exception:
                     spec = None
-                if getattr(spec, "dcp_replicated", False):
+                if spec is None or getattr(spec, "dcp_replicated", False):
+                    # spec None: layer owns no allocator KV at all (e.g. the
+                    # DSpark ring-buffer draft) - DCP sharding cannot apply.
                     continue
             if vllm_config.speculative_config is not None and interleave_size > 1:
                 assert layer_impl.supports_mtp_with_cp_non_trivial_interleave_size, (
