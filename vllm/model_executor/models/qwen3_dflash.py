@@ -280,7 +280,7 @@ class DFlashQwen3Attention(nn.Module):
             max_reqs = vcfg.scheduler_config.max_num_seqs
             shape = (
                 max_reqs,
-                self._ring_window,
+                self._ring_window + 1,  # slot W = trash bin for masked writes
                 self.num_kv_heads,
                 self.head_dim,
             )
@@ -344,10 +344,12 @@ class DFlashQwen3Attention(nn.Module):
         )
         row_max.scatter_reduce_(0, rows, pos, reduce="amax", include_self=False)
         keep = pos > (row_max[rows] - w)
-        rows = rows[keep]
-        slots = pos[keep].remainder(w)
-        kk = k.view(-1, self.num_kv_heads, self.head_dim)[keep]
-        vv = v.view(-1, self.num_kv_heads, self.head_dim)[keep]
+        # No boolean compaction (it forces a host sync to size the result);
+        # out-of-window tokens write to the trash slot W instead. In-window
+        # positions are W consecutive values -> unique slots -> deterministic.
+        slots = torch.where(keep, pos.remainder(w), torch.full_like(pos, w))
+        kk = k.view(-1, self.num_kv_heads, self.head_dim)
+        vv = v.view(-1, self.num_kv_heads, self.head_dim)
         self.ring_k[rows, slots] = kk
         self.ring_v[rows, slots] = vv
 
@@ -370,8 +372,8 @@ class DFlashQwen3Attention(nn.Module):
         kb = k.view(num_rows, gamma, self.num_kv_heads, self.head_dim)
         vb = v.view(num_rows, gamma, self.num_kv_heads, self.head_dim)
 
-        win_k = self.ring_k[rows]  # [R, W, kv, d]
-        win_v = self.ring_v[rows]
+        win_k = self.ring_k[rows, :w]  # [R, W, kv, d] (drop trash slot)
+        win_v = self.ring_v[rows, :w]
         keys = torch.cat([win_k, kb], dim=1)  # [R, W + gamma, kv, d]
         vals = torch.cat([win_v, vb], dim=1)
 
