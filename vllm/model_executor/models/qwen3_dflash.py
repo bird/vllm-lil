@@ -56,6 +56,44 @@ from .utils import (
 logger = init_logger(__name__)
 
 
+def _dspark_ring_window() -> int:
+    """Ring-buffer draft KV window (tokens). 0 disables ring mode.
+
+    The reference DSpark draft attends over a small sliding window of recent
+    context held in an internal cache (rafaelcaricio/vllm keeps it outside the
+    paged allocator). Ring mode reproduces that: per-layer [R, W] ring buffers,
+    dense SDPA over window+block, no draft KV in the vLLM allocator (specs
+    return None), which also makes the draft DCP-agnostic.
+    """
+    import os
+
+    if os.environ.get("VLLM_DSPARK_DRAFT_RING", "0") != "1":
+        return 0
+    return int(os.environ.get("VLLM_DSPARK_DRAFT_WINDOW", "1024"))
+
+
+class _DSparkRingCtx:
+    """Per-step side-channel state for ring attention (set by the speculator).
+
+    All tensors are persistent, fixed-shape device buffers mutated in-place so
+    CUDA graphs capturing the draft forward read stable addresses.
+    """
+
+    def __init__(self) -> None:
+        self.window: int = 0
+        self.num_query_per_req: int = 0
+        # [R_max] persistent ring row per active batch slot (identity-ish).
+        self.query_rows: torch.Tensor | None = None
+        # [R_max, 1, W + num_query_per_req] additive mask (0 or -inf).
+        self.attn_mask: torch.Tensor | None = None
+        # eager-ingest scratch (not graph-captured):
+        self.ctx_rows: torch.Tensor | None = None  # [num_ctx_tokens]
+        self.num_ctx_tokens: int = 0
+
+
+DSPARK_RING_CTX = _DSparkRingCtx()
+
+
 _DFLASH_VALID_LAYER_TYPES = frozenset({"full_attention", "sliding_attention"})
 
 
@@ -103,6 +141,11 @@ class DFlashAttention(Attention):
     """
 
     def get_kv_cache_spec(self, vllm_config: VllmConfig) -> KVCacheSpec | None:
+        # Ring mode: the draft holds its own [R, W] window cache per layer and
+        # never touches the paged allocator (reference-DSpark shape); nothing
+        # to register, and the draft becomes DCP-agnostic.
+        if _dspark_ring_window() > 0:
+            return None
         # The draft attends over the full context with a backend that cannot
         # reduce across DCP ranks; replicate the draft cache on every rank.
         dcp_replicated = (
@@ -225,6 +268,28 @@ class DFlashQwen3Attention(nn.Module):
         )
         self.q_norm = RMSNorm(self.head_dim, eps=rms_norm_eps)
         self.k_norm = RMSNorm(self.head_dim, eps=rms_norm_eps)
+        self._ring_window = _dspark_ring_window()
+        self.ring_k: torch.Tensor | None = None
+        self.ring_v: torch.Tensor | None = None
+        if self._ring_window > 0:
+            # Eager allocation: the draft forward is CUDA-graph captured and
+            # must read stable buffer addresses (no allocs inside capture).
+            from vllm.config import get_current_vllm_config
+
+            vcfg = get_current_vllm_config()
+            max_reqs = vcfg.scheduler_config.max_num_seqs
+            shape = (
+                max_reqs,
+                self._ring_window,
+                self.num_kv_heads,
+                self.head_dim,
+            )
+            self.ring_k = torch.zeros(
+                shape, dtype=vcfg.model_config.dtype, device="cuda"
+            )
+            self.ring_v = torch.zeros(
+                shape, dtype=vcfg.model_config.dtype, device="cuda"
+            )
 
     def forward(
         self,
@@ -249,9 +314,64 @@ class DFlashQwen3Attention(nn.Module):
 
         q, k = self.rotary_emb(positions, q, k)
 
-        attn_output = self.attn(q, k, v)
+        if self._ring_window > 0:
+            attn_output = self._ring_attention(q, k, v)
+        else:
+            attn_output = self.attn(q, k, v)
         output, _ = self.o_proj(attn_output)
         return output
+
+    def _ensure_ring(self, device: torch.device, dtype: torch.dtype) -> None:
+        assert self.ring_k is not None, "ring buffers must exist from __init__"
+
+    def ring_ingest(
+        self,
+        k: torch.Tensor,  # [N, num_kv_heads * head_dim], normed + roped
+        v: torch.Tensor,  # [N, num_kv_heads * head_dim]
+        rows: torch.Tensor,  # [N] ring row per token
+        positions: torch.Tensor,  # [N] absolute positions
+    ) -> None:
+        self._ensure_ring(k.device, k.dtype)
+        w = self._ring_window
+        slots = positions.to(torch.long).remainder(w)
+        kk = k.view(-1, self.num_kv_heads, self.head_dim)
+        vv = v.view(-1, self.num_kv_heads, self.head_dim)
+        self.ring_k[rows, slots] = kk
+        self.ring_v[rows, slots] = vv
+
+    def _ring_attention(
+        self,
+        q: torch.Tensor,  # [T, num_heads * head_dim]
+        k: torch.Tensor,  # [T, num_kv_heads * head_dim]
+        v: torch.Tensor,  # [T, num_kv_heads * head_dim]
+    ) -> torch.Tensor:
+        ctx = DSPARK_RING_CTX
+        gamma = ctx.num_query_per_req
+        w = self._ring_window
+        self._ensure_ring(q.device, q.dtype)
+        # Padded batch size is a capture-time constant per CUDA graph; derive
+        # it from the (padded) token count so each graph slices its own width.
+        num_rows = q.shape[0] // gamma
+        rows = ctx.query_rows[:num_rows]
+
+        qb = q.view(num_rows, gamma, self.num_heads, self.head_dim)
+        kb = k.view(num_rows, gamma, self.num_kv_heads, self.head_dim)
+        vb = v.view(num_rows, gamma, self.num_kv_heads, self.head_dim)
+
+        win_k = self.ring_k[rows]  # [R, W, kv, d]
+        win_v = self.ring_v[rows]
+        keys = torch.cat([win_k, kb], dim=1)  # [R, W + gamma, kv, d]
+        vals = torch.cat([win_v, vb], dim=1)
+
+        out = F.scaled_dot_product_attention(
+            qb.transpose(1, 2),  # [R, H, gamma, d]
+            keys.transpose(1, 2),  # [R, KV, W + gamma, d]
+            vals.transpose(1, 2),
+            attn_mask=ctx.attn_mask[:num_rows],  # [R, 1, 1, W + gamma]
+            scale=self.scaling,
+            enable_gqa=True,
+        )
+        return out.transpose(1, 2).reshape(num_rows * gamma, -1)
 
 
 class DFlashQwen3DecoderLayer(nn.Module):
@@ -460,6 +580,7 @@ class DFlashQwen3Model(nn.Module):
 
         # References to inner Attention layers for direct cache writes
         self._attn_layers = [layer.self_attn.attn for layer in self.layers]
+        self._ring_layers = [layer.self_attn for layer in self.layers]
 
     def precompute_and_store_context_kv(
         self,
@@ -545,10 +666,20 @@ class DFlashQwen3Model(nn.Module):
             return
 
         # --- Per-layer cache insert ---
-        # Accept all three caller conventions: the DSpark speculator passes a
-        # per-layer list, our DFlash speculator passes a Mapping keyed by attn
-        # layer name, and a bare tensor applies to every layer.
+        # Ring mode: write into each layer's internal window cache; slot and
+        # row bookkeeping comes from DSPARK_RING_CTX (set by the speculator,
+        # eager path only - never captured by CUDA graphs).
         all_k_final = all_k_flat.view(L, num_ctx, nkv, hd)
+        ring_ctx = DSPARK_RING_CTX
+        if _dspark_ring_window() > 0:
+            if context_slot_mapping is None or ring_ctx.ctx_rows is None:
+                return  # dummy run: no cache writes
+            rows = ring_ctx.ctx_rows[:num_ctx]
+            for i in range(L):
+                self._ring_layers[i].ring_ingest(
+                    all_k_final[i], all_v[i], rows, context_positions
+                )
+            return
         for i in range(L):
             attn = self._attn_layers[i]
             if isinstance(context_slot_mapping, (list, tuple)):

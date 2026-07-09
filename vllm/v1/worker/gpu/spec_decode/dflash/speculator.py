@@ -99,6 +99,41 @@ class DFlashSpeculator(DraftModelSpeculator):
         self.query_cudagraph_manager: DFlashCudaGraphManager | None = None
         self.draft_kv_cache_group_id: int = -1
 
+        from vllm.model_executor.models.qwen3_dflash import (
+            DSPARK_RING_CTX,
+            _dspark_ring_window,
+        )
+
+        self._ring_window = _dspark_ring_window()
+        if self._ring_window > 0:
+            w = self._ring_window
+            gamma = self.num_query_per_req
+            rmax = self.max_num_reqs
+            DSPARK_RING_CTX.window = w
+            DSPARK_RING_CTX.num_query_per_req = gamma
+            DSPARK_RING_CTX.query_rows = torch.zeros(
+                rmax, dtype=torch.long, device=device
+            )
+            # additive mask, broadcast over heads and query positions:
+            # [R, 1(head), 1(query), W + gamma]; block tail always visible.
+            DSPARK_RING_CTX.attn_mask = torch.zeros(
+                rmax, 1, 1, w + gamma, dtype=self.dtype, device=device
+            )
+            DSPARK_RING_CTX.ctx_rows = torch.zeros(
+                self.max_num_tokens, dtype=torch.long, device=device
+            )
+            self._ring_arange_w = torch.arange(w, device=device)
+            # scratch sinks for prepare_dflash_inputs paged bookkeeping
+            self._ring_scratch_slots = torch.zeros(
+                self.max_num_tokens, dtype=torch.int64, device=device
+            )
+            self._ring_scratch_ctx_slots = torch.zeros(
+                self.max_num_tokens, dtype=torch.int64, device=device
+            )
+            self._ring_dummy_block_table = torch.zeros(
+                rmax, 2, dtype=torch.int32, device=device
+            )
+
     def init_cudagraph_manager(self, cudagraph_mode: CUDAGraphMode) -> None:
         # PIECEWISE cudagraphs are not supported for dflash
         if cudagraph_mode.decode_mode() == CUDAGraphMode.FULL:
@@ -205,6 +240,10 @@ class DFlashSpeculator(DraftModelSpeculator):
     ) -> None:
         super().set_attn(model_state, kv_cache_config, block_tables)
 
+        if self._ring_window > 0:
+            self.draft_kv_cache_group_ids = []
+            self.draft_kv_cache_group_id = -1
+            return
         self.draft_kv_cache_group_ids = [
             gid for gid, g in enumerate(self.attn_groups) if g
         ]
@@ -392,14 +431,18 @@ class DFlashSpeculator(DraftModelSpeculator):
 
         # The query slot mapping is written into the shared BlockTables slot_mappings.
         # That buffer's address is what the captured CUDA graph reads from at replay.
-        assert self.draft_kv_cache_group_id >= 0
-        # Support multiple draft KV cache groups by preparing inputs once for each
-        for i, gid in enumerate(self.draft_kv_cache_group_ids):
+        if self._ring_window > 0:
+            # Ring mode: paged draft KV does not exist. Run the input prep once
+            # with scratch slot sinks (a max_model_len "block size" pins every
+            # dummy block-table lookup to row 0), then refresh the ring-side
+            # bookkeeping the graph-captured draft forward reads.
+            from vllm.model_executor.models.qwen3_dflash import DSPARK_RING_CTX
+
             prepare_dflash_inputs(
                 self.input_buffers,
-                self.block_tables.slot_mappings[gid],
+                self._ring_scratch_slots,
                 self.context_positions,
-                self._context_slot_mappings[i],
+                self._ring_scratch_ctx_slots,
                 self.sample_indices,
                 self.sample_pos,
                 self.sample_idx_mapping,
@@ -408,8 +451,8 @@ class DFlashSpeculator(DraftModelSpeculator):
                 num_rejected,
                 last_sampled,
                 next_prefill_tokens,
-                self.block_tables.input_block_tables[gid],
-                self.block_tables.block_sizes[gid],
+                self._ring_dummy_block_table,
+                self.max_model_len,
                 self.parallel_drafting_token_id,
                 self.num_query_per_req,
                 self.num_speculative_steps,
@@ -418,6 +461,55 @@ class DFlashSpeculator(DraftModelSpeculator):
                 self.max_model_len,
                 self.sample_from_anchor,
             )
+            w = self._ring_window
+            num_r = input_batch.num_reqs
+            idx_map = input_batch.idx_mapping[:num_r].to(torch.long)
+            DSPARK_RING_CTX.query_rows[:num_r] = idx_map
+            qsl = input_batch.query_start_loc[: num_r + 1].to(torch.long)
+            lens = qsl[1:] - qsl[:-1]
+            DSPARK_RING_CTX.ctx_rows[:num_target_tokens] = (
+                torch.repeat_interleave(idx_map, lens)
+            )
+            DSPARK_RING_CTX.num_ctx_tokens = num_target_tokens
+            valid = torch.clamp(
+                input_batch.seq_lens[:num_r].to(torch.long), max=w
+            )
+            win_mask = torch.where(
+                self._ring_arange_w[None, :] < valid[:, None],
+                torch.zeros((), dtype=self.dtype, device=valid.device),
+                torch.full(
+                    (), float("-inf"), dtype=self.dtype, device=valid.device
+                ),
+            )
+            DSPARK_RING_CTX.attn_mask[idx_map, 0, 0, :w] = win_mask
+        else:
+            assert self.draft_kv_cache_group_id >= 0
+            # Support multiple draft KV cache groups by preparing inputs once
+            # for each
+            for i, gid in enumerate(self.draft_kv_cache_group_ids):
+                prepare_dflash_inputs(
+                    self.input_buffers,
+                    self.block_tables.slot_mappings[gid],
+                    self.context_positions,
+                    self._context_slot_mappings[i],
+                    self.sample_indices,
+                    self.sample_pos,
+                    self.sample_idx_mapping,
+                    input_batch,
+                    num_sampled,
+                    num_rejected,
+                    last_sampled,
+                    next_prefill_tokens,
+                    self.block_tables.input_block_tables[gid],
+                    self.block_tables.block_sizes[gid],
+                    self.parallel_drafting_token_id,
+                    self.num_query_per_req,
+                    self.num_speculative_steps,
+                    self.max_num_reqs,
+                    self.max_num_tokens,
+                    self.max_model_len,
+                    self.sample_from_anchor,
+                )
 
         # Pre-insert context K/V into the cache. Runs eagerly outside the captured graph
         # because the context shape varies per step. During dummy runs the block tables
@@ -425,6 +517,8 @@ class DFlashSpeculator(DraftModelSpeculator):
         # Each layer uses the context slots of its own kv-cache group.
         if dummy_run:
             context_slots: torch.Tensor | list[torch.Tensor | None] | None = None
+        elif self._ring_window > 0:
+            context_slots = self._ring_scratch_ctx_slots[:num_target_tokens]
         elif self._layer_group_idx is not None:
             context_slots = [
                 self._context_slot_mappings[gidx][:num_target_tokens]
