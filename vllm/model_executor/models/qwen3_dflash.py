@@ -571,11 +571,32 @@ class DFlashQwen3Model(nn.Module):
             else:
                 self._fused_kv_bias = None
         else:
-            # Quantized draft (e.g. online fp8): weights are packed and cannot
-            # be raw-sliced into one fused GEMM. The ingest falls back to each
-            # layer's own quant-aware qkv projection.
-            self._fused_kv_weight = None
-            self._fused_kv_bias = None
+            # Quantized draft (e.g. online fp8): recover exact dequantized KV
+            # weights once at load by running each layer's own quant GEMM on an
+            # identity matrix (layout-proof), then fuse to keep the one-GEMM
+            # ingest fast path. ~126MB bf16 for the GLM speculator.
+            hidden = self.config.hidden_size
+            eye = torch.eye(
+                hidden,
+                dtype=self.embed_tokens.weight.dtype
+                if hasattr(self, "embed_tokens")
+                else torch.bfloat16,
+                device=attn0.qkv_proj.weight.device,
+            )
+            kv_weights = []
+            kv_biases = []
+            with torch.no_grad():
+                for a in layers_attn:
+                    full, _ = a.qkv_proj(eye)  # [hidden, q+2kv] == W^T (+bias)
+                    if has_bias:
+                        bias = a.qkv_proj.bias
+                        full = full - bias.unsqueeze(0)
+                        kv_biases.append(bias[a.q_size :].clone())
+                    kv_weights.append(full.t()[a.q_size :].contiguous())
+            self._fused_kv_weight = torch.cat(kv_weights, dim=0)
+            self._fused_kv_bias = (
+                torch.cat(kv_biases, dim=0) if has_bias else None
+            )
         self._ingest_layers_attn = layers_attn
 
         # K-norm weights: list of [head_dim] tensors, one per layer.
