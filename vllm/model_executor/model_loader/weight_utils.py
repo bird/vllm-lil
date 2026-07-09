@@ -295,10 +295,11 @@ def get_quant_config(
     # hf_overrides
     hf_overrides = model_config.hf_overrides
     if not isinstance(hf_overrides, dict):
-        raise ValueError(
-            "hf_overrides must be a dict for get_quant_config "
-            "to get the quantization config from it."
-        )
+        # Draft model configs (e.g. speculators-format DSpark checkpoints
+        # quantized online via speculative_config["quantization"]) carry no
+        # dict overrides; fall through to the online-quant / file-based paths
+        # instead of failing.
+        hf_overrides = {}
     quantization_config_file = hf_overrides.get("quantization_config_file", None)
     if quantization_config_file is not None:
         if hasattr(quant_cls, "from_config_file"):
