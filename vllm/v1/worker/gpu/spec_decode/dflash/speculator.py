@@ -444,7 +444,7 @@ class DFlashSpeculator(DraftModelSpeculator):
                         )
                         .to(torch.bfloat16)
                         .cpu(),
-                        "input_ids": self.input_buffers.input_ids[
+                        "input_ids": input_batch.input_ids[
                             :num_target_tokens
                         ]
                         .detach()
