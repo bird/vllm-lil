@@ -1535,8 +1535,10 @@ def group_and_unify_kv_cache_specs(
         mla_block = next(iter(mla_specs.values())).block_size
         merged = dict(mla_specs)
         merged.update(draft_full_specs)
+        import os as _os
         if (
-            all(s.block_size == mla_block for s in draft_full_specs.values())
+            _os.environ.get("VLLM_DRAFT_OWN_KV_GROUP", "0") != "1"
+            and all(s.block_size == mla_block for s in draft_full_specs.values())
             and UniformTypeKVCacheSpecs.from_specs(merged) is not None
         ):
             mla_specs = merged

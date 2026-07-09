@@ -141,6 +141,19 @@ def update_dspark(config_dict: dict, pre_trained_config: dict) -> None:
     # Speculators DSpark uses the 1+N fill-in block (anchor is a bonus token).
     pre_trained_config["dspark_bonus_anchor"] = True
 
+    # Reference DSpark drafts attend over a small sliding window of context
+    # (rafaelcaricio/vllm keeps an internal window cache; the vLLM merge went
+    # full-context, which mismatches windowed training and decays acceptance
+    # with depth). Opt-in override until window metadata ships in checkpoints.
+    import os as _os
+    _win = int(_os.environ.get("VLLM_DSPARK_DRAFT_WINDOW", "0"))
+    if _win > 0:
+        n_layers = pre_trained_config.get("num_hidden_layers") or len(
+            pre_trained_config.get("layer_types") or []
+        ) or 5
+        pre_trained_config["sliding_window"] = _win
+        pre_trained_config["layer_types"] = ["sliding_attention"] * n_layers
+
     aux_layer_ids = config_dict["aux_hidden_state_layer_ids"]
     pre_trained_config["eagle_aux_hidden_state_layer_ids"] = aux_layer_ids
     # DSpark indexes target layers as aux_id - 1 (matches the dense configs).
