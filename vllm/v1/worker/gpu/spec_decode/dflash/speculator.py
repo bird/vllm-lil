@@ -138,6 +138,19 @@ class DFlashSpeculator(DraftModelSpeculator):
             self._ring_dummy_block_table = torch.zeros(
                 rmax, 2, dtype=torch.int32, device=device
             )
+        import os as _os
+
+        self._capture_dir = _os.environ.get("VLLM_DSPARK_CAPTURE_DIR", "")
+        if self._capture_dir:
+            from vllm.distributed.parallel_state import (
+                get_tensor_model_parallel_rank,
+            )
+
+            if get_tensor_model_parallel_rank() == 0:
+                _os.makedirs(self._capture_dir, exist_ok=True)
+                self._capture_idx = 0
+            else:
+                self._capture_dir = ""
 
     def init_cudagraph_manager(self, cudagraph_mode: CUDAGraphMode) -> None:
         # PIECEWISE cudagraphs are not supported for dflash
@@ -408,6 +421,37 @@ class DFlashSpeculator(DraftModelSpeculator):
         else:
             hidden_states = last_hidden_states
         self.hidden_states[:num_target_tokens].copy_(hidden_states[:num_target_tokens])
+
+        if self._capture_dir and not dummy_run and num_target_tokens > 0:
+            # Speculator-finetune data: OUR target's combined aux hidden per
+            # accepted/context token, with ids and absolute positions. bf16,
+            # ~12KB/token; rank 0 only (TP-identical).
+            try:
+                import time as _time
+
+                payload = {
+                    "hidden": hidden_states[:num_target_tokens]
+                    .detach()
+                    .to(torch.bfloat16)
+                    .cpu(),
+                    "input_ids": self.input_buffers.input_ids[
+                        :num_target_tokens
+                    ]
+                    .detach()
+                    .cpu(),
+                    "positions": self.context_positions[:num_target_tokens]
+                    .detach()
+                    .cpu(),
+                }
+                self._capture_idx += 1
+                if self._capture_idx % 50 == 0:
+                    torch.save(
+                        payload,
+                        f"{self._capture_dir}/cap-{int(_time.time()*1000)}"
+                        f"-{self._capture_idx}.pt",
+                    )
+            except Exception:
+                pass
 
         self._copy_request_inputs(
             num_reqs,
