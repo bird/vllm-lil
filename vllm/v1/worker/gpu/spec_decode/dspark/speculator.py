@@ -65,6 +65,22 @@ class DSparkSpeculator(DFlashSpeculator):
             self.num_speculative_steps, dtype=torch.int32, device=device
         )
 
+        import os as _os
+        self.conf_gate_active = bool(_os.environ.get("VLLM_DSPARK_CONF_GATE"))
+        self._conf_thresh = float(
+            _os.environ.get("VLLM_DSPARK_CONF_THRESH", "-1e9")
+        )
+        self._conf_log = int(_os.environ.get("VLLM_DSPARK_CONF_LOG", "0"))
+        self._conf_step = 0
+        # Per-request submitted-draft length (scheduler consumes via the
+        # DraftTokensHandler placeholder lists). Full length by default.
+        self.draft_lens = torch.full(
+            (self.max_num_reqs,),
+            self.num_speculative_steps,
+            dtype=torch.int32,
+            device=device,
+        )
+
         self._anchor_idx = (
             torch.arange(self.max_num_reqs, dtype=torch.int64, device=device)
             * self.num_query_per_req
@@ -115,6 +131,31 @@ class DSparkSpeculator(DFlashSpeculator):
         # Anchor (bonus) token per request = the input id at query offset 0,
         # read via the precomputed persistent index (fixed buffer for capture).
         prev = self.input_buffers.input_ids[self._anchor_idx[:num_reqs]]
+
+        # Confidence gate: on low predicted acceptance of the FIRST draft
+        # position, submit only 1 draft token (verify width 2 instead of
+        # 1 + n_spec; both power-of-2). bs==1 only - keeps per-step width
+        # uniform, sidestepping ragged-batch paths.
+        self.draft_lens[:num_reqs] = n_spec
+        if (
+            self.conf_gate_active
+            and num_reqs == 1
+            and self.model.model.confidence_head is not None
+        ):
+            h1 = sample_hidden.view(num_reqs, n_spec, -1)[:, 0]
+            me0 = self.model.markov_embed(prev)
+            logit = self.model.confidence_logit(h1, me0)
+            self.draft_lens[:num_reqs] = torch.where(
+                logit >= self._conf_thresh,
+                torch.full_like(self.draft_lens[:num_reqs], n_spec),
+                torch.ones_like(self.draft_lens[:num_reqs]),
+            )
+            if self._conf_log:
+                self._conf_step += 1
+                if self._conf_step % self._conf_log == 0:
+                    v = float(logit[0])
+                    g = int(self.draft_lens[0])
+                    print(f"[conf-gate] logit={v:+.3f} len={g}", flush=True)
 
         for i in range(n_spec):
             # Sequential stage: Markov bias from the previously sampled token.

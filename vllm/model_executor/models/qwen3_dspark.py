@@ -90,6 +90,18 @@ class Qwen3DSparkModel(DFlashQwen3Model):
             config.markov_rank,
             prefix=maybe_prefix(prefix, "markov_head"),
         )
+        # Confidence head (per-draft-position acceptance predictor). Wired
+        # only when VLLM_DSPARK_CONF_GATE is set; weights come from the
+        # checkpoint (confidence_head.proj.{weight,bias}).
+        import os as _os
+        import torch.nn as _nn
+        if _os.environ.get("VLLM_DSPARK_CONF_GATE"):
+            self.confidence_head = _nn.Module()
+            self.confidence_head.proj = _nn.Linear(
+                config.hidden_size + config.markov_rank, 1, bias=True
+            )
+        else:
+            self.confidence_head = None
 
 
 class Qwen3DSparkForCausalLM(DFlashQwen3ForCausalLM):
@@ -146,6 +158,14 @@ class Qwen3DSparkForCausalLM(DFlashQwen3ForCausalLM):
     def markov_bias(self, markov_embed: torch.Tensor) -> torch.Tensor:
         return self.model.markov_head.bias(markov_embed, self.logits_processor)
 
+    def confidence_logit(
+        self, hidden: torch.Tensor, markov_embed: torch.Tensor
+    ) -> torch.Tensor:
+        # Same input layout the head was trained with: cat([h, markov_embed]).
+        proj = self.model.confidence_head.proj
+        x = torch.cat([hidden, markov_embed], dim=-1).to(proj.weight.dtype)
+        return proj(x).squeeze(-1).float()
+
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]):
         model_weights = {}
         includes_embed_tokens = False
@@ -173,7 +193,10 @@ class Qwen3DSparkForCausalLM(DFlashQwen3ForCausalLM):
         # confidence_head is not wired into inference yet; skip its weights.
         # embed_tokens / lm_head are optional; when omitted they are shared from
         # the target by load_dspark_model, so skip the unloaded params here.
-        skip_substrs = ["mask_embedding", "confidence_head"]
+        import os as _os
+        skip_substrs = ["mask_embedding"]
+        if not _os.environ.get("VLLM_DSPARK_CONF_GATE"):
+            skip_substrs.append("confidence_head")
         if not includes_embed_tokens:
             skip_substrs.append("embed_tokens")
         if not includes_lm_head:

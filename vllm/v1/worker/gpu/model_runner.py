@@ -1583,9 +1583,15 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             with record_function_or_nullcontext(
                 f"vllm:v2/target/{phase}/set_draft_tokens"
             ):
+                _lens = None
+                if getattr(self.speculator, "conf_gate_active", False):
+                    _lens = self.speculator.draft_lens[
+                        : len(input_batch.req_ids)
+                    ]
                 self.draft_tokens_handler.set_draft_tokens(
                     input_batch,
                     self.req_states.draft_tokens[input_batch.idx_mapping],
+                    draft_lens=_lens,
                 )
 
         # Post-step KV connector related operations.
