@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import itertools
+import os
 from collections.abc import Sequence
 from dataclasses import dataclass
 from typing import Literal, overload
@@ -20,6 +21,25 @@ from vllm.v1.metrics.stats import PrefixCacheStats
 from vllm.v1.request import Request, RequestStatus
 
 logger = init_logger(__name__)
+
+
+def _dspark_ring_cache_trim() -> int:
+    """Tokens to trim from prefix-cache hits when the DSpark ring is active.
+
+    The draft ring window is rebuilt from target aux hidden states, which
+    exist only for tokens the target actually recomputes. A full cache hit
+    would leave the ring empty for the whole cached span and collapse
+    acceptance until W fresh tokens accumulate. Trimming the hit by the ring
+    window forces recomputation (and re-ingest) of exactly that span.
+    Override with VLLM_DSPARK_CACHE_TRIM (0 disables).
+    """
+    v = os.environ.get("VLLM_DSPARK_CACHE_TRIM")
+    if v is not None:
+        return max(0, int(v))
+    if os.environ.get("VLLM_DSPARK_DRAFT_RING"):
+        return int(os.environ.get("VLLM_DSPARK_DRAFT_WINDOW", "0") or 0)
+    return 0
+
 
 
 @dataclass
@@ -225,6 +245,9 @@ class KVCacheManager:
         # num_computed_tokens to be block-size aligned. Removing this limitation
         # could slightly improve performance in the future.
         max_cache_hit_length = request.num_tokens - 1
+        _trim = _dspark_ring_cache_trim()
+        if _trim > 0:
+            max_cache_hit_length = max(0, max_cache_hit_length - _trim)
         computed_blocks, num_new_computed_tokens = (
             self.coordinator.find_longest_cache_hit(
                 request.block_hashes, max_cache_hit_length
