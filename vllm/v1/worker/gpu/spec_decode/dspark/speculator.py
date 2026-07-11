@@ -80,6 +80,11 @@ class DSparkSpeculator(DFlashSpeculator):
             dtype=torch.int32,
             device=device,
         )
+        print(
+            f"[conf-gate-init] active={self.conf_gate_active} "
+            f"thresh={self._conf_thresh} max_reqs={self.max_num_reqs}",
+            flush=True,
+        )
 
         self._anchor_idx = (
             torch.arange(self.max_num_reqs, dtype=torch.int64, device=device)
@@ -137,11 +142,21 @@ class DSparkSpeculator(DFlashSpeculator):
         # 1 + n_spec; both power-of-2). bs==1 only - keeps per-step width
         # uniform, sidestepping ragged-batch paths.
         self.draft_lens[:num_reqs] = n_spec
+        if not hasattr(self, "_gate_dbg"):
+            self._gate_dbg = 0
+        self._gate_dbg += 1
+        if self._gate_dbg <= 3:
+            print(f"[conf-gate-path] call#{self._gate_dbg} num_reqs={num_reqs} "
+                  f"active={self.conf_gate_active} "
+                  f"head={self.model.model.confidence_head is not None}",
+                  flush=True)
         if (
             self.conf_gate_active
             and num_reqs == 1
             and self.model.model.confidence_head is not None
         ):
+            print(f"[conf-gate-capture] ops active num_reqs={num_reqs}",
+                  flush=True)
             h1 = sample_hidden.view(num_reqs, n_spec, -1)[:, 0]
             me0 = self.model.markov_embed(prev)
             logit = self.model.confidence_logit(h1, me0)

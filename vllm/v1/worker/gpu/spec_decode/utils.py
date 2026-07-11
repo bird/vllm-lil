@@ -55,6 +55,9 @@ class DraftTokensHandler:
             self.copy_event.record()
 
     def get_draft_tokens(self) -> DraftTokenIds | None:
+        if not hasattr(self, "_dbg_n"):
+            self._dbg_n = 0
+        self._dbg_n += 1
         lens = None
         if self.draft_lens_np is not None:
             self.lens_event.synchronize()
@@ -71,6 +74,10 @@ class DraftTokensHandler:
         else:
             # This case only happens when async scheduling is disabled.
             draft_token_ids = [[-1] * self.num_draft_tokens for _ in self.req_ids]
+        if self._dbg_n <= 3:
+            print(f"[handler-dbg] call#{self._dbg_n} "
+                  f"lens_np={None if self.draft_lens_np is None else list(self.draft_lens_np)} "
+                  f"emit={[len(r) for r in draft_token_ids][:4]}", flush=True)
         return DraftTokenIds(self.req_ids, draft_token_ids)
 
 

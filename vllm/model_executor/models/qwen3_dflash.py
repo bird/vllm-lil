@@ -325,14 +325,12 @@ class DFlashQwen3Attention(nn.Module):
     def _ensure_ring(self, device: torch.device, dtype: torch.dtype) -> None:
         assert self.ring_k is not None, "ring buffers must exist from __init__"
 
-    def ring_ingest(
-        self,
-        k: torch.Tensor,  # [N, num_kv_heads * head_dim], normed + roped
-        v: torch.Tensor,  # [N, num_kv_heads * head_dim]
-        rows: torch.Tensor,  # [N] ring row per token
-        positions: torch.Tensor,  # [N] absolute positions
-    ) -> None:
-        self._ensure_ring(k.device, k.dtype)
+    def ring_compute_slots(
+        self, rows: torch.Tensor, positions: torch.Tensor
+    ) -> torch.Tensor:
+        """Slot addressing for a ring write. Identical across layers - the
+        caller computes it ONCE per ingest and passes it to every layer's
+        ring_ingest (it used to be recomputed 5x: pure launch overhead)."""
         w = self._ring_window
         pos = positions.to(torch.long)
         # A prefill chunk can exceed W, wrapping slots several times within one
@@ -348,7 +346,19 @@ class DFlashQwen3Attention(nn.Module):
         # No boolean compaction (it forces a host sync to size the result);
         # out-of-window tokens write to the trash slot W instead. In-window
         # positions are W consecutive values -> unique slots -> deterministic.
-        slots = torch.where(keep, pos.remainder(w), torch.full_like(pos, w))
+        return torch.where(keep, pos.remainder(w), torch.full_like(pos, w))
+
+    def ring_ingest(
+        self,
+        k: torch.Tensor,  # [N, num_kv_heads * head_dim], normed + roped
+        v: torch.Tensor,  # [N, num_kv_heads * head_dim]
+        rows: torch.Tensor,  # [N] ring row per token
+        positions: torch.Tensor,  # [N] absolute positions
+        slots: torch.Tensor | None = None,
+    ) -> None:
+        self._ensure_ring(k.device, k.dtype)
+        if slots is None:
+            slots = self.ring_compute_slots(rows, positions)
         kk = k.view(-1, self.num_kv_heads, self.head_dim)
         vv = v.view(-1, self.num_kv_heads, self.head_dim)
         self.ring_k[rows, slots] = kk
@@ -601,6 +611,13 @@ class DFlashQwen3Model(nn.Module):
 
         # K-norm weights: list of [head_dim] tensors, one per layer.
         self._k_norm_weights = [a.k_norm.weight.data for a in layers_attn]
+        # Stacked [L, 1, 1, head_dim] weights + a ones vector: lets the
+        # context-KV path run ONE unit-weight rms_norm over all layers and a
+        # single broadcast multiply instead of a 5-iteration kernel loop.
+        self._k_norm_stacked = torch.stack(
+            list(self._k_norm_weights)
+        ).view(len(layers_attn), 1, 1, -1)
+        self._k_norm_ones = torch.ones_like(self._k_norm_weights[0])
 
         # RoPE parameters
         self._rope_head_size = attn0.rotary_emb.head_size
@@ -692,15 +709,19 @@ class DFlashQwen3Model(nn.Module):
         all_k = all_kv[0]  # [L, num_ctx, nkv, hd], contiguous
         all_v = all_kv[1]  # [L, num_ctx, nkv, hd], contiguous
 
-        # --- Per-layer RMSNorm K (3D: [num_ctx, nkv, hd] per layer) ---
+        # --- Fused RMSNorm K: one unit-weight norm over all layers plus a
+        # single broadcast multiply by stacked per-layer weights (replaces a
+        # 5-iteration loop of small kernels). ---
         all_k_normed = torch.empty_like(all_k)
-        for i in range(L):
-            ops.rms_norm(
-                all_k_normed[i],
-                all_k[i],
-                self._k_norm_weights[i],
-                self._rms_norm_eps,
-            )
+        ops.rms_norm(
+            all_k_normed.view(-1, hd),
+            all_k.view(-1, hd),
+            self._k_norm_ones,
+            self._rms_norm_eps,
+        )
+        all_k_normed = all_k_normed.mul_(
+            self._k_norm_stacked.to(all_k_normed.dtype)
+        )
 
         # --- Fused RoPE across all layers ---
         # View as [L * num_ctx, kv] so RoPE sees one big batch (no copy).
@@ -732,9 +753,13 @@ class DFlashQwen3Model(nn.Module):
             if context_slot_mapping is None or ring_ctx.ctx_rows is None:
                 return  # dummy run: no cache writes
             rows = ring_ctx.ctx_rows[:num_ctx]
+            slots = self._ring_layers[0].ring_compute_slots(
+                rows, context_positions
+            )
             for i in range(L):
                 self._ring_layers[i].ring_ingest(
-                    all_k_final[i], all_v[i], rows, context_positions
+                    all_k_final[i], all_v[i], rows, context_positions,
+                    slots=slots,
                 )
             return
         for i in range(L):

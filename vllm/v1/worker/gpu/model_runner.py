@@ -1584,6 +1584,13 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 f"vllm:v2/target/{phase}/set_draft_tokens"
             ):
                 _lens = None
+                if not hasattr(self, "_lens_dbg"):
+                    self._lens_dbg = 0
+                self._lens_dbg += 1
+                if self._lens_dbg <= 3:
+                    print(f"[runner-dbg] call#{self._lens_dbg} gate_attr="
+                          f"{getattr(self.speculator, chr(99)+chr(111)+chr(110)+chr(102)+chr(95)+chr(103)+chr(97)+chr(116)+chr(101)+chr(95)+chr(97)+chr(99)+chr(116)+chr(105)+chr(118)+chr(101), None)}",
+                          flush=True)
                 if getattr(self.speculator, "conf_gate_active", False):
                     _lens = self.speculator.draft_lens[
                         : len(input_batch.req_ids)
